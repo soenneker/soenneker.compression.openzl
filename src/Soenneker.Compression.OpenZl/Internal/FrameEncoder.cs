@@ -23,15 +23,28 @@ internal static class FrameEncoder
             AddNumeric(plans, source, options.NumericWidth);
         }
         else if (options.Mode == OpenZlCompressionMode.Auto)
-            foreach (int width in new[] { 1, 2, 4, 8 }) if (source.Length % width == 0) AddNumeric(plans, source, width);
-        byte[]? best = null;
-        foreach (var plan in plans)
+            for (int width = 1; width <= 8; width *= 2) if (source.Length % width == 0) AddNumeric(plans, source, width);
+        CompressionPlan best = plans[0];
+        if (plans.Count > 1)
         {
-            byte[] frame = Write(source, plan, options);
-            if (best == null || frame.Length < best.Length) best = frame;
+            // Frame header and checksum lengths are identical across candidates.
+            using var header = new WireWriter();
+            long bestBlockLength = long.MaxValue;
+            foreach (CompressionPlan plan in plans)
+            {
+                header.SetLength(0);
+                WriteBlockHeader(header, plan, options.FormatVersion);
+                long blockLength = header.Length + plan.Stored.Length;
+                if (blockLength < bestBlockLength)
+                {
+                    bestBlockLength = blockLength;
+                    best = plan;
+                }
+            }
         }
-        return best!;
+        return Write(source, best, options);
     }
+
     private static void AddNumeric(List<CompressionPlan> plans, ReadOnlySpan<byte> source, int width)
     {
         int count = source.Length / width;
@@ -42,15 +55,14 @@ internal static class FrameEncoder
         ulong[] deltas = new ulong[count - 1]; ulong mask = Bits.Mask(width);
         for (int i = 1; i < count; i++) deltas[i - 1] = unchecked(raw[i] - raw[i - 1]) & mask;
         AddPacked(plans, deltas, width, [new(1, source[..width].ToArray()), new(9, [])]);
-        ulong[] zigzag = new ulong[deltas.Length];
-        for (int i = 0; i < deltas.Length; i++) zigzag[i] = ((deltas[i] << 1) ^ unchecked(0UL - (deltas[i] >> (width * 8 - 1)))) & mask;
-        AddPacked(plans, zigzag, width, [new(3, []), new(1, source[..width].ToArray()), new(9, [])]);
+        for (int i = 0; i < deltas.Length; i++) deltas[i] = ((deltas[i] << 1) ^ unchecked(0UL - (deltas[i] >> (width * 8 - 1)))) & mask;
+        AddPacked(plans, deltas, width, [new(3, []), new(1, source[..width].ToArray()), new(9, [])]);
         ulong minimum = raw.Min();
         if (minimum != 0)
         {
-            ulong[] shifted = new ulong[count]; for (int i = 0; i < count; i++) shifted[i] = raw[i] - minimum;
+            for (int i = 0; i < count; i++) raw[i] -= minimum;
             byte[] header = new byte[1 + width]; header[0] = (byte)width; Bits.Number(header.AsSpan(1), minimum);
-            AddPacked(plans, shifted, width, [new(35, header), new(9, [])]);
+            AddPacked(plans, raw, width, [new(35, header), new(9, [])]);
         }
     }
     private static void AddPacked(List<CompressionPlan> plans, ulong[] values, int width, List<GraphNode> tail)
@@ -80,17 +92,8 @@ internal static class FrameEncoder
         writer.WriteByte(1); writer.Varint((ulong)source.Length + 1);
         if (comment.Length > 0) { writer.Varint((ulong)comment.Length); writer.Write(comment); }
         if (options.CompressedChecksum) writer.WriteByte((byte)XxHash3.Hash(writer.GetBuffer().AsSpan(0, (int)writer.Length)));
-        int blockStart = (int)writer.Length, count = plan.Nodes.Count;
-        writer.Varint((ulong)count + 1); writer.Varint(1);
-        writer.Packed(new int[count], 1);
-        writer.Packed(plan.Nodes.Select(x => x.Codec).ToArray(), options.FormatVersion < 24 ? 6 : 7);
-        writer.Packed(plan.Nodes.Select(x => x.Header.Length == 0 ? 0 : 1).ToArray(), 1);
-        foreach (var node in plan.Nodes) if (node.Header.Length > 0) writer.Varint((ulong)node.Header.Length - 1);
-        writer.Packed(new int[count], 1); // no variable inputs
-        writer.Packed(new int[count], 1); // one regenerated stream per node
-        writer.Packed(new int[count], Bits.Width(count + 1)); // linear chain: output immediately follows input
-        writer.Varint((ulong)plan.Stored.Length);
-        foreach (var node in plan.Nodes) writer.Write(node.Header);
+        int blockStart = (int)writer.Length;
+        WriteBlockHeader(writer, plan, options.FormatVersion);
         writer.Write(plan.Stored);
         if (options.ContentChecksum) { BinaryPrimitives.WriteUInt32LittleEndian(word, (uint)XxHash3.Hash(source)); writer.Write(word); }
         if (options.CompressedChecksum)
@@ -98,5 +101,26 @@ internal static class FrameEncoder
             BinaryPrimitives.WriteUInt32LittleEndian(word, (uint)XxHash3.Hash(writer.GetBuffer().AsSpan(blockStart, (int)writer.Length - blockStart))); writer.Write(word);
         }
         writer.WriteByte(0); return writer.ToArray();
+    }
+
+    private static void WriteBlockHeader(WireWriter writer, CompressionPlan plan, int formatVersion)
+    {
+        int count = plan.Nodes.Count;
+        // Encoder plans use at most four nodes (LZ4, bitpack, delta and zigzag).
+        Span<int> values = stackalloc int[count];
+        values.Clear();
+        writer.Varint((ulong)count + 1); writer.Varint(1);
+        writer.Packed(values, 1);
+        for (int i = 0; i < count; i++) values[i] = plan.Nodes[i].Codec;
+        writer.Packed(values, formatVersion < 24 ? 6 : 7);
+        for (int i = 0; i < count; i++) values[i] = plan.Nodes[i].Header.Length == 0 ? 0 : 1;
+        writer.Packed(values, 1);
+        values.Clear();
+        foreach (var node in plan.Nodes) if (node.Header.Length > 0) writer.Varint((ulong)node.Header.Length - 1);
+        writer.Packed(values, 1); // no variable inputs
+        writer.Packed(values, 1); // one regenerated stream per node
+        writer.Packed(values, Bits.Width(count + 1)); // linear chain: output immediately follows input
+        writer.Varint((ulong)plan.Stored.Length);
+        foreach (var node in plan.Nodes) writer.Write(node.Header);
     }
 }

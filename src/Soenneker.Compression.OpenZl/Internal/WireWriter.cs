@@ -12,7 +12,9 @@ internal sealed class WireWriter : MemoryStream
     }
     public void Packed(ReadOnlySpan<int> values, int bits)
     {
-        byte[] buffer = new byte[checked((int)(((long)values.Length * bits + 7) / 8))];
+        int length = checked((int)(((long)values.Length * bits + 7) / 8));
+        Span<byte> buffer = length <= 128 ? stackalloc byte[length] : new byte[length];
+        buffer.Clear();
         for (int i = 0; i < values.Length; i++) Bits.Write(buffer, (long)i * bits, bits, (ulong)values[i]);
         Write(buffer);
     }

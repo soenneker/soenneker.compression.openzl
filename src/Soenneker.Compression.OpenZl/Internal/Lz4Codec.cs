@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Buffers.Binary;
 using System.IO;
 
@@ -38,8 +39,30 @@ internal static class Lz4Codec
     }
     public static byte[] Encode(ReadOnlySpan<byte> input)
     {
+        if (input.Length < 12)
+        {
+            byte[] literals = new byte[input.Length + 1];
+            literals[0] = (byte)(input.Length << 4);
+            input.CopyTo(literals.AsSpan(1));
+            return literals;
+        }
+
+        const int tableSize = 1 << 16;
+        int[] table = ArrayPool<int>.Shared.Rent(tableSize);
+        try
+        {
+            Array.Fill(table, -1, 0, tableSize);
+            return EncodeMatches(input, table);
+        }
+        finally
+        {
+            ArrayPool<int>.Shared.Return(table);
+        }
+    }
+
+    private static byte[] EncodeMatches(ReadOnlySpan<byte> input, int[] table)
+    {
         using var output = new WireWriter();
-        int[] table = new int[65536]; Array.Fill(table, -1);
         int p = 0, anchor = 0;
         while (p <= input.Length - 12)
         {
